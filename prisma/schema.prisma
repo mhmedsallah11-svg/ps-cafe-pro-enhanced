@@ -1,0 +1,533 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== TENANT & MULTI-TENANCY ====================
+model Tenant {
+  id                    String                 @id @default(cuid())
+  name                  String
+  email                 String                 @unique
+  phone                 String                 @default("")
+  passwordHash          String
+  trialStartDate        DateTime               @default(now())
+  trialEndDate          DateTime
+  isSubscribed          Boolean                @default(false)
+  isOnboarded           Boolean                @default(false)
+  createdAt             DateTime               @default(now())
+  users                 User[]
+  devices               Device[]
+  sessions              Session[]
+  inventoryItems        InventoryItem[]
+  orders                Order[]
+  sales                 Sale[]
+  saleItems             SaleItem[]
+  deviceTypes           DeviceType[]
+  financialTransactions FinancialTransaction[]
+  sessionSegments       SessionSegment[]
+  shifts                Shift[]
+  appSettings           AppSetting[]
+  tenantSettings        TenantSettings?
+  auditLogs             AuditLog[]
+  announcements         SystemAnnouncement[]
+  pricingTiers          PricingTier[]
+  inventoryMovements    InventoryMovement[]
+  expenseCategories     ExpenseCategory[]
+  
+  @@index([createdAt])
+}
+
+// ==================== USERS & AUTHENTICATION ====================
+model User {
+  id                    String                 @id @default(cuid())
+  username              String                 @unique
+  password              String
+  role                  String                 // ADMIN, EMPLOYEE, SUPER_ADMIN
+  permissions           String?
+  tokenVersion          Int                    @default(0)
+  isActive              Boolean                @default(true)
+  lastLogin             DateTime?
+  tenantId              String?
+  tenant                Tenant?                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  financialTransactions FinancialTransaction[]
+  sales                 Sale[]
+  endedSessions         Session[]              @relation("EndedBy")
+  sessions              Session[]              @relation("StartedBy")
+  openedShifts          Shift[]                @relation("ShiftOpened")
+  closedShifts          Shift[]                @relation("ShiftClosed")
+  auditLogs             AuditLog[]
+  orders                Order[]                @relation("AddedByUser")
+  
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+
+  @@index([tenantId, role])
+  @@index([isActive])
+}
+
+// ==================== DEVICES ====================
+model Device {
+  id               String    @id @default(cuid())
+  number           String
+  type             String
+  hourlyRateSingle Decimal   @default(0)
+  hourlyRateMulti  Decimal   @default(0)
+  isDeleted        Boolean   @default(false)
+  status           String    @default("AVAILABLE") // AVAILABLE, ACTIVE, MAINTENANCE
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  
+  tenantId         String?
+  tenant           Tenant?   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  sessions         Session[]
+  
+  @@unique([tenantId, number])
+  @@index([tenantId])
+  @@index([status])
+}
+
+// ==================== SESSION MANAGEMENT (PHASE 1) ====================
+model Session {
+  id                    String    @id @default(cuid())
+  deviceId              String
+  userId                String
+  endedByUserId         String?
+  
+  // Core timing - stored server-side for persistence
+  startTime             DateTime  @default(now())
+  endTime               DateTime?
+  
+  // Session state
+  type                  String    @default("SINGLE") // SINGLE, MULTI
+  durationMinutes       Int?
+  isMulti               Boolean   @default(false)
+  isActive              Boolean   @default(true)
+  
+  // Cost tracking
+  accumulatedTimeCost   Decimal   @default(0)
+  accumulatedSingleCost Decimal   @default(0)
+  accumulatedMultiCost  Decimal   @default(0)
+  totalOrdersCost       Decimal   @default(0)
+  totalSessionCost      Decimal   @default(0)
+  
+  lastRateChangeTime    DateTime  @default(now())
+  lastHeartbeat         DateTime  @default(now())
+  
+  // Shift tracking - ENHANCED for proper shift transitions
+  shiftId               String?
+  primaryShiftId        String?   // Shift where session started
+  shiftTransition       Boolean   @default(false) // TRUE if session spans multiple shifts
+  
+  tenantId              String?
+  tenant                Tenant?   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  segments              SessionSegment[]
+  orders                Order[]
+  endedByUser           User?     @relation("EndedBy", fields: [endedByUserId], references: [id])
+  user                  User      @relation("StartedBy", fields: [userId], references: [id])
+  device                Device    @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  shift                 Shift?    @relation(fields: [shiftId], references: [id])
+  primaryShift          Shift?    @relation("PrimaryShift", fields: [primaryShiftId], references: [id])
+  
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([tenantId, isActive, lastHeartbeat])
+  @@index([tenantId, startTime])
+  @@index([deviceId, isActive])
+  @@index([shiftId])
+  @@index([primaryShiftId])
+}
+
+// ==================== SESSION SEGMENTS (PHASE 1) ====================
+// When a session spans two shifts, we split the cost
+model SessionSegment {
+  id           String   @id @default(cuid())
+  sessionId    String
+  shiftId      String
+  
+  deviceName   String
+  deviceType   String
+  mode         String   @default("SINGLE") // SINGLE or MULTI
+  
+  startTime    DateTime
+  endTime      DateTime
+  durationMins Float
+  cost         Decimal  @default(0)
+  
+  tenantId     String?
+  tenant       Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  session      Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  shift        Shift    @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  
+  createdAt    DateTime @default(now())
+
+  @@index([sessionId])
+  @@index([shiftId])
+  @@index([tenantId])
+}
+
+// ==================== ORDERS (ENHANCED - PHASE 1 & 2) ====================
+model Order {
+  id              String        @id @default(cuid())
+  sessionId       String
+  inventoryItemId String
+  quantity        Int
+  
+  // Price snapshot at time of sale
+  priceAtTime     Decimal
+  totalPrice      Decimal       @default(0)
+  
+  status          String        @default("DELIVERED") // PENDING, DELIVERED, CANCELLED
+  
+  // Audit trail
+  addedByUserId   String
+  addedAt         DateTime      @default(now())
+  shiftId         String?
+  
+  // Soft delete for financial integrity
+  isDeleted       Boolean       @default(false)
+  deletedAt       DateTime?
+  deletedByUserId String?
+  deletionReason  String?
+  
+  tenantId        String?
+  
+  // Relations
+  tenant          Tenant?       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  session         Session       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  shift           Shift?        @relation(fields: [shiftId], references: [id])
+  addedByUser     User          @relation("AddedByUser", fields: [addedByUserId], references: [id])
+  
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([tenantId, shiftId])
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt])
+  @@index([sessionId])
+  @@index([inventoryItemId])
+}
+
+// ==================== INVENTORY (PHASE 2) ====================
+model InventoryItem {
+  id              String           @id @default(cuid())
+  name            String
+  category        String
+  
+  // Pricing
+  sellingPrice    Decimal          @default(0)
+  purchasePrice   Decimal          @default(0)
+  
+  // Stock management
+  stock           Int              @default(0)
+  minimumStock    Int              @default(5)
+  isActive        Boolean          @default(true)
+  
+  // Tracking
+  lastRestockDate DateTime?
+  lastRestockQty  Int              @default(0)
+  
+  tenantId        String?
+  tenant          Tenant?          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  orders          Order[]
+  sales           SaleItem[]
+  movements       InventoryMovement[]
+  
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([tenantId])
+  @@index([category])
+  @@index([minimumStock, stock]) // For low stock alerts
+}
+
+// ==================== INVENTORY MOVEMENTS (PHASE 2) ====================
+// Detailed tracking of all inventory changes
+model InventoryMovement {
+  id              String    @id @default(cuid())
+  
+  inventoryItemId String
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
+  
+  type            String    // PURCHASE, SALE, ADJUSTMENT, DAMAGED, RETURN
+  quantity        Int
+  
+  // Reference to what caused this movement
+  orderId         String?
+  saleId          String?
+  
+  // Cost tracking
+  unitCost        Decimal   @default(0)
+  totalCost       Decimal   @default(0)
+  
+  // Audit
+  recordedByUserId String
+  reason          String?
+  metadata        Json?     // For additional context
+  
+  shiftId         String?
+  tenantId        String?
+  tenant          Tenant?   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  createdAt       DateTime  @default(now())
+
+  @@index([inventoryItemId])
+  @@index([type])
+  @@index([tenantId])
+  @@index([createdAt])
+}
+
+// ==================== SALES ====================
+model Sale {
+  id          String     @id @default(cuid())
+  createdAt   DateTime   @default(now())
+  
+  totalAmount Decimal    @default(0)
+  
+  userId      String?
+  user        User?      @relation(fields: [userId], references: [id])
+  
+  shiftId     String?
+  shift       Shift?     @relation(fields: [shiftId], references: [id])
+  
+  tenantId    String?
+  tenant      Tenant?    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  items       SaleItem[]
+  
+  // Soft delete
+  isDeleted   Boolean    @default(false)
+  deletedAt   DateTime?
+  deletedByUserId String?
+
+  @@index([tenantId, createdAt])
+  @@index([shiftId])
+}
+
+model SaleItem {
+  id              String        @id @default(cuid())
+  saleId          String
+  sale            Sale          @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  
+  inventoryItemId String
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  
+  quantity        Int
+  priceAtTime     Decimal
+  
+  tenantId        String?
+  tenant          Tenant?       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([saleId])
+  @@index([inventoryItemId])
+}
+
+// ==================== DEVICE TYPES ====================
+model DeviceType {
+  id        String   @id @default(cuid())
+  name      String
+  color     String   @default("blue")
+  icon      String   @default("Gamepad2")
+  createdAt DateTime @default(now())
+  tenantId  String?
+  tenant    Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+// ==================== FINANCIAL TRANSACTIONS (PHASE 4) ====================
+model FinancialTransaction {
+  id          String    @id @default(cuid())
+  
+  type        String    // CASH_IN, CASH_OUT, EXPENSE, SALE, CORRECTION
+  category    String?   // For expenses: ELECTRICITY, INTERNET, MAINTENANCE, etc.
+  
+  amount      Decimal
+  description String
+  
+  // Who and when
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  
+  shiftId     String
+  shift       Shift     @relation(fields: [shiftId], references: [id])
+  
+  // For corrections
+  originalTransactionId String?
+  correctionReason      String?
+  
+  metadata    Json?     // For additional context
+  
+  tenantId    String?
+  tenant      Tenant?   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, type])
+  @@index([shiftId])
+}
+
+// ==================== EXPENSE CATEGORIES (PHASE 4) ====================
+model ExpenseCategory {
+  id          String   @id @default(cuid())
+  name        String   // Electricity, Internet, Maintenance, etc.
+  description String?
+  icon        String?
+  
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+// ==================== SHIFTS (ENHANCED - PHASE 1 & 4) ====================
+model Shift {
+  id                    String                 @id @default(cuid())
+  
+  // Timing
+  openedAt              DateTime               @default(now())
+  closedAt              DateTime?
+  
+  // Users
+  openedByUserId        String
+  closedByUserId        String?
+  openedByUser          User                   @relation("ShiftOpened", fields: [openedByUserId], references: [id])
+  closedByUser          User?                  @relation("ShiftClosed", fields: [closedByUserId], references: [id])
+  
+  // Cash Management
+  openingFloat          Decimal                @default(0)
+  
+  // Financial tracking
+  psRevenue             Decimal                @default(0)
+  productRevenue        Decimal                @default(0)
+  otherRevenue          Decimal                @default(0)
+  totalRevenue          Decimal                @default(0)
+  
+  expenses              Decimal                @default(0)
+  cogs                  Decimal                @default(0)
+  
+  expectedCash          Decimal                @default(0)
+  actualCash            Decimal?
+  variance              Decimal?
+  
+  // Status
+  notes                 String?
+  status                String                 @default("OPEN") // OPEN / CLOSED
+  
+  tenantId              String?
+  tenant                Tenant?                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  // Relations
+  sessions              Session[]
+  primarySessions       Session[]              @relation("PrimaryShift")
+  segments              SessionSegment[]
+  orders                Order[]
+  sales                 Sale[]
+  financialTransactions FinancialTransaction[]
+  
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+
+  @@index([tenantId, status])
+  @@index([tenantId, openedAt])
+  @@index([tenantId, closedAt])
+  // PostgreSQL partial unique index for only one OPEN shift per tenant
+  // CREATE UNIQUE INDEX only_one_open_shift_per_tenant
+  //   ON "Shift" ("tenantId") WHERE status = 'OPEN';
+}
+
+// ==================== SETTINGS ====================
+model AppSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  updatedAt DateTime @updatedAt
+  tenantId  String?
+  tenant    Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+model TenantSettings {
+  id            String   @id @default(cuid())
+  currency      String   @default("EGP")
+  currencySymbol String   @default("ج.م")
+  timezone      String   @default("Africa/Cairo")
+  language      String   @default("ar")
+  updatedAt     DateTime @updatedAt
+  
+  tenantId      String   @unique
+  tenant        Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+// ==================== AUDIT LOGS (PHASE 1 & 5) ====================
+model AuditLog {
+  id            String   @id @default(cuid())
+  
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  
+  action        String   // LOGIN, LOGOUT, START_SESSION, END_SESSION, ADD_ORDER, etc.
+  entityType    String   // Order, InventoryItem, FinancialTransaction, Session, etc.
+  entityId      String   // ID of affected entity
+  
+  reason        String?  // Why was this action taken?
+  metadata      Json?    // Additional context
+  
+  // For corrections/deletions
+  oldValue      Json?
+  newValue      Json?
+  
+  tenantId      String?
+  tenant        Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+  @@index([tenantId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@index([action])
+}
+
+// ==================== ANNOUNCEMENTS & SYSTEM ====================
+model PricingTier {
+  id          String   @id @default(cuid())
+  name        String
+  startTime   String?  // "14:00" (24h format)
+  endTime     String?  // "20:00" (24h format)
+  dayOfWeek   Int?     // 0 = Sunday, 6 = Saturday, null = all days
+  multiplier  Decimal  @default(1.0)
+  
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId])
+}
+
+model SystemAnnouncement {
+  id        String   @id @default(cuid())
+  message   String
+  type      String   @default("INFO") // INFO, WARNING, UPDATE
+  isActive  Boolean  @default(true)
+  createdBy String
+  createdAt DateTime @default(now())
+  tenantId  String?  // null = global broadcast
+  tenant    Tenant?  @relation(fields: [tenantId], references: [id])
+
+  @@index([isActive, createdAt, tenantId])
+}
